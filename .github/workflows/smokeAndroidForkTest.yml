@@ -80,6 +80,18 @@ jobs:
         # https://account.mapbox.com/access-tokens/).
         run: ./scripts/setup-mapbox-sdk.sh ${{ secrets.MAPBOX_SDK_DOWNLOAD_TOKEN }}
 
+      - name: Install Android CMake 3.30.5 (Hermes pins this exact version)
+        # GitHub bumps ubuntu-latest periodically and CMake 3.30.5 isn't
+        # always pre-installed. Without it Gradle fails at
+        # `configureCMakeRelease[x86_64]` for the hermes-engine target
+        # with `[CXX1300] CMake '3.30.5' was not found`. sdkmanager
+        # writes it under $ANDROID_HOME/cmake/3.30.5/bin where Gradle
+        # auto-detects it.
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "cmake;3.30.5" 2>&1 | tail -5
+          ls "$ANDROID_HOME/cmake/3.30.5/bin/cmake"
+
       - name: Build developmentDebug APK locally (no S3 cache, x86_64 only)
         # --local forces Rock to skip its S3 lookup. On the fork we have
         # no AWS credentials and Rock S3 access is locked down to the
