@@ -32,7 +32,7 @@ jobs:
     # If anyone accidentally PRs this file to upstream, the job no-ops.
     if: ${{ github.repository == 'rustam-callstack/App' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       AGENT_DEVICE_VERSION: "0.14.7"
       STANDALONE_NEW_DOT: "true"
@@ -80,11 +80,26 @@ jobs:
         # https://account.mapbox.com/access-tokens/).
         run: ./scripts/setup-mapbox-sdk.sh ${{ secrets.MAPBOX_SDK_DOWNLOAD_TOKEN }}
 
-      - name: Build developmentDebug APK locally (no S3 cache)
+      - name: Build developmentDebug APK locally (no S3 cache, x86_64 only)
         # --local forces Rock to skip its S3 lookup. On the fork we have
         # no AWS credentials and Rock S3 access is locked down to the
         # upstream org anyway.
-        run: npx rock build:android --variant developmentDebug --local
+        #
+        # reactNativeArchitectures=x86_64 narrows React Native's C++
+        # cross-compile from 4 archs (arm64-v8a, armeabi-v7a, x86, x86_64)
+        # down to just the one we need for the emulator. Without this
+        # the Gradle build alone takes ~25 min on ubuntu-latest, blowing
+        # the timeout. With it, ~10-12 min.
+        #
+        # `--active-arch-only` would do roughly the same on its own, but
+        # is documented as a no-op in non-interactive (CI) environments —
+        # the explicit `-P` property is more reliable.
+        run: |
+          npx rock build:android \
+            --variant developmentDebug \
+            --local \
+            --active-arch-only \
+            --extra-params="-PreactNativeArchitectures=x86_64"
 
       - name: AVD cache
         uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb
