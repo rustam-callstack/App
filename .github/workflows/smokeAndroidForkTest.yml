@@ -1,0 +1,135 @@
+name: Android Smoke (fork-test)
+
+# Fork-only sibling of `smokeAndroid.yml`. Runs the same agent-device smoke
+# on a public GitHub-hosted runner, with the secrets and infrastructure
+# rewired so it can execute on a personal fork without the upstream
+# Blacksmith / OS_BOTIFY_TOKEN / AWS credentials chain.
+#
+# DIFFERENCES FROM smokeAndroid.yml:
+#   - runs-on: ubuntu-latest (free for public repos; KVM-enabled since 2024)
+#     instead of blacksmith-4vcpu-ubuntu-2404
+#   - submodules: false on checkout (no OS_BOTIFY_TOKEN, no Mobile-Expensify
+#     access). Standalone NewDot build doesn't need the submodule.
+#   - No AWS-credentials step. Rock is forced to --local so it skips the
+#     S3 cache lookup; we always do a local Gradle build (~15-20 min).
+#   - Hard-guarded to refuse to run on the upstream repo via an `if:` on
+#     `github.repository`.
+#
+# DO NOT MERGE THIS FILE TO UPSTREAM. It exists to validate the smoke
+# workflow's plumbing on a fork before the real thing lands at upstream.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-android-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Android emulator smoke (fork-test)
+    # Defensive guard: this workflow is hard-coded for the personal fork.
+    # If anyone accidentally PRs this file to upstream, the job no-ops.
+    if: ${{ github.repository == 'rustam-callstack/App' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AGENT_DEVICE_VERSION: "0.14.7"
+      STANDALONE_NEW_DOT: "true"
+
+    steps:
+      - name: Checkout
+        # v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          # No submodules — Mobile-Expensify is private and the fork has no
+          # OS_BOTIFY_TOKEN. Standalone NewDot build doesn't need it.
+          submodules: false
+
+      - name: Verify KVM / fix permissions if needed
+        run: |
+          if ! ls -la /dev/kvm 2>/dev/null; then
+            echo "::error::No /dev/kvm on this runner — emulator will fall back to TCG and the job will time out"
+            exit 1
+          fi
+          if [ ! -w /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Node
+        uses: ./.github/actions/composite/setupNode
+        with:
+          IS_HYBRID_BUILD: "false"
+
+      - name: Install agent-device CLI
+        run: npm install -g "agent-device@${AGENT_DEVICE_VERSION}"
+
+      - name: Configure MapBox SDK
+        # Required for the @rnmapbox/maps Gradle dependency to resolve.
+        # The fork must have a MAPBOX_SDK_DOWNLOAD_TOKEN secret (sk. token
+        # with DOWNLOADS:READ scope, created at
+        # https://account.mapbox.com/access-tokens/).
+        run: ./scripts/setup-mapbox-sdk.sh ${{ secrets.MAPBOX_SDK_DOWNLOAD_TOKEN }}
+
+      - name: Build developmentDebug APK locally (no S3 cache)
+        # --local forces Rock to skip its S3 lookup. On the fork we have
+        # no AWS credentials and Rock S3 access is locked down to the
+        # upstream org anyway.
+        run: npx rock build:android --variant developmentDebug --local
+
+      - name: AVD cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+            ~/.android/adbkey
+            ~/.android/adbkey.pub
+          key: avd-pixel8-api35-x86_64-v1-${{ hashFiles('.github/workflows/smokeAndroidForkTest.yml') }}
+
+      - name: Prime AVD snapshot (cache miss only)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_8
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: false
+          script: |
+            adb wait-for-device
+            until [ -n "$(adb shell getprop sys.boot_completed | tr -d '\r')" ]; do sleep 2; done
+            echo "AVD primed"
+
+      - name: Run smoke
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_8
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: bash .github/scripts/agent-device-smoke.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: smoke-android-fork-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
