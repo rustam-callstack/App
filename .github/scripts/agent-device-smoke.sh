@@ -32,6 +32,10 @@ mkdir -p "$ART"
 # "session already bound" guard.
 cleanup() {
   set +e
+  # Dump logcat once at the end (cheaper than a continuous tee that
+  # accumulates RAM/disk over a long job).
+  adb logcat -d -v time '*:W' 'ReactNativeJS:V' 'ReactNative:V' \
+    > "$ART/logcat.txt" 2>/dev/null
   agent-device record stop --session "$SESSION" >/dev/null 2>&1
   agent-device close --session "$SESSION" >/dev/null 2>&1
   jobs -p | xargs -r kill 2>/dev/null
@@ -41,8 +45,10 @@ trap cleanup EXIT
 # Stale state from a previous run on a warm runner.
 agent-device close --session "$SESSION" >/dev/null 2>&1 || true
 
-# Logcat tee — verbose JS, warnings+errors for everything else. Async.
-adb logcat -v time *:W ReactNativeJS:V ReactNative:V > "$ART/logcat.txt" &
+# Reset logcat ring buffer so the end-of-script dump captures only
+# what happened during this smoke. Continuous tee was previously
+# eating runner memory on long jobs; we dump on EXIT instead.
+adb logcat -c 2>/dev/null || true
 
 SERIAL=$(adb get-serialno)
 echo "::notice::emulator serial=$SERIAL"
@@ -105,7 +111,7 @@ while [ "$SECONDS" -lt "$SIGNIN_LOAD_TIMEOUT" ]; do
     cp "$PROBE" "$ART/snapshot-signin.txt"
     break
   fi
-  sleep 4
+  sleep 6
 done
 echo "::endgroup::"
 

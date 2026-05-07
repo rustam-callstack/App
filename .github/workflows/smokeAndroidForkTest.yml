@@ -113,6 +113,14 @@ jobs:
             --active-arch-only \
             --extra-params="-PreactNativeArchitectures=x86_64"
 
+      - name: Stop Gradle daemon (free ~1.5 GB before emulator)
+        # The 2-core 7 GB ubuntu-latest runner OOMs during the smoke
+        # step if the Gradle daemon stays alive alongside Metro,
+        # the emulator, agent-device, and logcat. Kill it before
+        # the emulator-runner action takes over.
+        run: |
+          cd android && ./gradlew --stop || true
+
       - name: AVD cache
         uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb
         id: avd-cache
