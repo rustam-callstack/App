@@ -1,0 +1,178 @@
+name: Android Smoke Skill Full (fork-test)
+
+# Validates the agent-device-smoke skill END-TO-END: boots an emulator,
+# installs the Claude Code CLI, and invokes
+#   claude --print "/agent-device-smoke android-signin"
+# Claude Code in the runner then reads SKILL.md, runs the pre-flight
+# gates, picks a mode, and shells out to the engine. This is the
+# closest CI proxy to a developer typing the slash-command in their
+# IDE — it exercises SKILL.md interpretation + mode selection +
+# pre-flight gates that the helper-only workflow doesn't touch.
+#
+# Costs: each dispatch pays for Claude Code's own reasoning tokens
+# (~$0.50–1) on top of whatever the inner driver spends in LLM mode.
+# Run after `smokeAndroidSkillReplayForkTest.yml` is green — that
+# confirms the engine path before paying the extra LLM cost here.
+#
+# DO NOT MERGE TO UPSTREAM. Hard-guarded to the personal fork.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-android-skill-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Android skill full (fork-test)
+    if: ${{ github.repository == 'rustam-callstack/App' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AGENT_DEVICE_VERSION: "0.14.7"
+      STANDALONE_NEW_DOT: "true"
+      LLM_TOKEN_BUDGET: "200000"
+      ANTHROPIC_MODEL: "claude-sonnet-4-6"
+      # Pin the Claude Code CLI so a future breaking release of
+      # @anthropic-ai/claude-code doesn't silently change the skill
+      # invocation surface mid-iteration.
+      CLAUDE_CODE_VERSION: "1.0.86"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: false
+
+      - name: Verify KVM / fix permissions if needed
+        run: |
+          if ! ls -la /dev/kvm 2>/dev/null; then
+            echo "::error::No /dev/kvm on this runner — emulator will fall back to TCG and the job will time out"
+            exit 1
+          fi
+          if [ ! -w /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Node
+        uses: ./.github/actions/composite/setupNode
+        with:
+          IS_HYBRID_BUILD: "false"
+
+      - name: Install agent-device CLI
+        run: npm install -g "agent-device@${AGENT_DEVICE_VERSION}"
+
+      - name: Install Claude Code CLI
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+      - name: Configure MapBox SDK
+        run: ./scripts/setup-mapbox-sdk.sh ${{ secrets.MAPBOX_SDK_DOWNLOAD_TOKEN }}
+
+      - name: Install Android CMake 3.30.5 (Hermes pins this exact version)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "cmake;3.30.5" 2>&1 | tail -5
+          ls "$ANDROID_HOME/cmake/3.30.5/bin/cmake"
+
+      - name: Build developmentDebug APK locally (no S3 cache, x86_64 only)
+        run: |
+          npx rock build:android \
+            --variant developmentDebug \
+            --local \
+            --active-arch-only \
+            --extra-params="-PreactNativeArchitectures=x86_64"
+
+      - name: Stop Gradle daemon (free ~1.5 GB before emulator)
+        run: |
+          cd android && ./gradlew --stop || true
+
+      - name: AVD cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+            ~/.android/adbkey
+            ~/.android/adbkey.pub
+          key: avd-pixel8-api35-x86_64-v1-${{ hashFiles('.github/workflows/smokeAndroidSkillForkTest.yml') }}
+
+      - name: Prime AVD snapshot (cache miss only)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: false
+          script: |
+            adb wait-for-device
+            until [ -n "$(adb shell getprop sys.boot_completed | tr -d '\r')" ]; do sleep 2; done
+            echo "AVD primed"
+
+      - name: Run skill via headless Claude Code
+        # `claude --print` is non-interactive: Claude reads the prompt,
+        # acts, prints a final response, exits. The skill's SKILL.md
+        # is auto-loaded because it lives at .claude/skills/.
+        #
+        # --allowedTools is broad enough to let the skill invoke
+        # `npm run smoke:android:llm`, `npx ts-node`, `agent-device`,
+        # `adb`, and read SKILL.md / test case files. We deliberately
+        # do NOT auto-allow Edit/Write — the skill should not be
+        # modifying source code in CI.
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: |
+            mkdir -p artifacts
+            claude --print \
+              --model "$ANTHROPIC_MODEL" \
+              --allowedTools "Bash,Read,Glob,Grep,Skill" \
+              --output-format text \
+              "Run the agent-device-smoke skill against tests/smoke/android-signin.testcase.txt. Use LLM mode (ANTHROPIC_API_KEY is set). Report each step's pass/fail, the final cache-diff summary, and exit cleanly. Do not ask me any clarifying questions — pick reasonable defaults." \
+              | tee artifacts/claude-output.txt
+            EXIT=$?
+            if [ "$EXIT" -ne 0 ]; then
+              echo "::error::claude --print exited with $EXIT"
+              exit $EXIT
+            fi
+            # The skill should have produced the engine's standard
+            # artifacts (cache-diff.txt, step-*-{pre,post}.txt, etc.).
+            # Surface a quick summary in the workflow log.
+            if [ -f artifacts/cache-diff.txt ]; then
+              echo "::group::cache-diff.txt"
+              cat artifacts/cache-diff.txt
+              echo "::endgroup::"
+            else
+              echo "::warning::no cache-diff.txt — skill may not have run the engine end-to-end"
+            fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: smoke-android-skill-fork-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14

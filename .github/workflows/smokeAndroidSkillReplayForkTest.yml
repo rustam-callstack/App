@@ -1,0 +1,138 @@
+name: Android Smoke Skill Replay (fork-test)
+
+# Validates the agent-device-smoke skill's bundled `replay-only.ts`
+# helper on the same emulator config as Phase 1's fork-test workflow.
+# Replay mode hits the committed cache, no LLM call, no Anthropic API
+# spend. Failure here means the skill's helper script regressed
+# against the committed cache (UI shape drift, tooling change, etc.)
+# rather than an LLM-flake.
+#
+# Pairs with `smokeAndroidSkillForkTest.yml` which exercises the full
+# skill via headless `claude --print`. This workflow is the cheaper
+# canary — run it first; only run the full-skill workflow once this
+# is green.
+#
+# DO NOT MERGE TO UPSTREAM. Hard-guarded to the personal fork.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-android-skill-replay-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Android skill replay (fork-test)
+    if: ${{ github.repository == 'rustam-callstack/App' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AGENT_DEVICE_VERSION: "0.14.7"
+      STANDALONE_NEW_DOT: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: false
+
+      - name: Verify KVM / fix permissions if needed
+        run: |
+          if ! ls -la /dev/kvm 2>/dev/null; then
+            echo "::error::No /dev/kvm on this runner — emulator will fall back to TCG and the job will time out"
+            exit 1
+          fi
+          if [ ! -w /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Node
+        uses: ./.github/actions/composite/setupNode
+        with:
+          IS_HYBRID_BUILD: "false"
+
+      - name: Install agent-device CLI
+        run: npm install -g "agent-device@${AGENT_DEVICE_VERSION}"
+
+      - name: Configure MapBox SDK
+        run: ./scripts/setup-mapbox-sdk.sh ${{ secrets.MAPBOX_SDK_DOWNLOAD_TOKEN }}
+
+      - name: Install Android CMake 3.30.5 (Hermes pins this exact version)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "cmake;3.30.5" 2>&1 | tail -5
+          ls "$ANDROID_HOME/cmake/3.30.5/bin/cmake"
+
+      - name: Build developmentDebug APK locally (no S3 cache, x86_64 only)
+        run: |
+          npx rock build:android \
+            --variant developmentDebug \
+            --local \
+            --active-arch-only \
+            --extra-params="-PreactNativeArchitectures=x86_64"
+
+      - name: Stop Gradle daemon (free ~1.5 GB before emulator)
+        run: |
+          cd android && ./gradlew --stop || true
+
+      - name: AVD cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+            ~/.android/adbkey
+            ~/.android/adbkey.pub
+          key: avd-pixel8-api35-x86_64-v1-${{ hashFiles('.github/workflows/smokeAndroidSkillReplayForkTest.yml') }}
+
+      - name: Prime AVD snapshot (cache miss only)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: false
+          script: |
+            adb wait-for-device
+            until [ -n "$(adb shell getprop sys.boot_completed | tr -d '\r')" ]; do sleep 2; done
+            echo "AVD primed"
+
+      - name: Run skill replay helper
+        # Replay mode: no ANTHROPIC_API_KEY. The helper hard-fails on
+        # cache miss with a structured error — this is the deterministic
+        # canary path the skill instructs Claude Code to use when no
+        # API key is available.
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: npx ts-node .claude/skills/agent-device-smoke/scripts/replay-only.ts tests/smoke/android-signin.testcase.txt
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: smoke-android-skill-replay-fork-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
