@@ -36,6 +36,10 @@ jobs:
       STANDALONE_NEW_DOT: "true"
       LLM_TOKEN_BUDGET: "200000"
       ANTHROPIC_MODEL: "claude-sonnet-4-6"
+      # Diagnostic mode for the step-2 fill-recording investigation.
+      # Captures full LLM tool_use args + dispatch decisions in the
+      # llm-trace.jsonl artifact. Disable once the bug is fixed.
+      DEBUG_LLM: "1"
 
     steps:
       - name: Checkout
@@ -118,7 +122,14 @@ jobs:
             until [ -n "$(adb shell getprop sys.boot_completed | tr -d '\r')" ]; do sleep 2; done
             echo "AVD primed"
 
-      - name: Run smoke (LLM-driven)
+      - name: Force cache-miss for the diagnostic run
+        # Temporary: delete the committed cache so every step exercises
+        # the LLM path and the verbose trace captures step 2's actual
+        # tool_use sequence. Revert this step once the recording bug
+        # is fixed and we want to test cache-hit again.
+        run: rm -f tests/smoke/cache/android-signin.testcase.json
+
+      - name: Run smoke (LLM-driven, DEBUG_LLM=1)
         uses: reactivecircus/android-emulator-runner@v2
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
