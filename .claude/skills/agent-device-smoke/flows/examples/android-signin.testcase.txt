@@ -1,0 +1,19 @@
+# Sample test case bundled with the agent-device-smoke skill.
+#
+# This is a copy of tests/smoke/android-signin.testcase.txt — the
+# canonical case that the CI canary (smokeAndroidLLM.yml) runs on
+# every PR. Keep this copy in sync if you change the canonical one,
+# or remove this file and have the skill resolve to the canonical
+# path. See ../README.md for the format spec.
+
+1. Wait for the app to fully load and the SignIn screen to appear.
+   expect: snapshot.contains_text("Phone or email")
+
+2. Enter "rustam.zeinalov@callstack.com" into the email/phone field.
+   expect: snapshot.field_with_text("rustam.zeinalov@callstack.com").exists
+
+3. Press the Continue button.
+   expect: appstate.foreground == "com.expensify.chat.dev"
+
+4. Wait for the magic-code screen to appear.
+   expect: snapshot.contains_text("Magic code")
