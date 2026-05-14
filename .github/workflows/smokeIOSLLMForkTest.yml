@@ -92,18 +92,24 @@ jobs:
         # Fork has no AWS credentials so we skip Rock entirely and go
         # straight to xcodebuild. Active arch only to keep the build
         # narrow on free macos-latest.
+        # Scheme: "New Expensify Dev" (with spaces) — standalone NewDot
+        # dev scheme. Config: DebugDevelopment — matches the existing
+        # Pods xcconfig pattern. `set -o pipefail` so xcodebuild errors
+        # surface through the xcbeautify pipe.
         run: |
-          set -e
+          set -eo pipefail
           xcodebuild \
             -workspace ios/NewExpensify.xcworkspace \
-            -scheme NewExpensify \
-            -configuration Debug \
+            -scheme "New Expensify Dev" \
+            -configuration DebugDevelopment \
             -sdk iphonesimulator \
             -derivedDataPath ios/build \
             -arch arm64 \
             ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
             | xcbeautify
+          test -d "ios/build/Build/Products/DebugDevelopment-iphonesimulator/NewExpensify.app" \
+            || { echo "::error::xcodebuild succeeded but .app missing from DerivedData"; exit 1; }
 
       - name: Boot iOS simulator
         run: |
