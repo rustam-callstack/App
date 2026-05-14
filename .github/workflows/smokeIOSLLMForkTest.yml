@@ -1,0 +1,132 @@
+name: iOS Smoke LLM (fork-test)
+
+# Fork-only sibling of `smokeIOSLLM.yml`. Same LLM-driven test
+# runner, but rewired to run on the user's personal fork without the
+# upstream Blacksmith Mac / OS_BOTIFY_TOKEN / AWS credentials chain.
+#
+# DIFFERENCES FROM smokeIOSLLM.yml:
+#   - runs-on: macos-latest (free GHA public-repo tier; ~50–60 min
+#     wall-clock vs ~25–30 min on Blacksmith M4)
+#   - submodules: false on checkout (no OS_BOTIFY_TOKEN, no
+#     Mobile-Expensify access — standalone NewDot build doesn't need
+#     it)
+#   - No AWS credentials step. Rock is forced off via the xcodebuild
+#     fallback path; we always do a local build.
+#   - Hard-guarded to refuse to run on the upstream repo via an
+#     `if:` on `github.repository`.
+#
+# DO NOT MERGE TO UPSTREAM.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-ios-llm-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: iOS simulator smoke LLM (fork-test)
+    if: ${{ github.repository == 'rustam-callstack/App' }}
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      AGENT_DEVICE_VERSION: "0.14.7"
+      STANDALONE_NEW_DOT: "true"
+      LLM_TOKEN_BUDGET: "200000"
+      ANTHROPIC_MODEL: "claude-sonnet-4-6"
+      PLATFORM: "ios"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: false
+
+      - name: Select Xcode
+        # macos-latest ships multiple Xcodes; pick the newest available.
+        # `xcode-select -p` reports the current default after selection.
+        run: |
+          XCODE=$(ls -1d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcode-select -p
+
+      - name: Setup Node
+        uses: ./.github/actions/composite/setupNode
+        with:
+          IS_HYBRID_BUILD: "false"
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Install agent-device CLI
+        run: npm install -g "agent-device@${AGENT_DEVICE_VERSION}"
+
+      - name: Configure MapBox SDK
+        run: ./scripts/setup-mapbox-sdk.sh ${{ secrets.MAPBOX_SDK_DOWNLOAD_TOKEN }}
+
+      - name: CocoaPods cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb
+        with:
+          path: |
+            ios/Pods
+            ~/.cocoapods
+          key: ios-fork-pods-${{ hashFiles('ios/Podfile.lock', 'ios/firebase.json') }}
+          restore-keys: |
+            ios-fork-pods-
+
+      - name: DerivedData cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb
+        with:
+          path: ios/build
+          key: ios-fork-deriveddata-${{ hashFiles('ios/Podfile.lock', 'ios/**/*.{m,mm,swift,h,c,cpp}') }}
+          restore-keys: |
+            ios-fork-deriveddata-
+
+      - name: Pod install
+        run: npm run pod-install
+
+      - name: Build dev iOS simulator app (xcodebuild)
+        # Fork has no AWS credentials so we skip Rock entirely and go
+        # straight to xcodebuild. Active arch only to keep the build
+        # narrow on free macos-latest.
+        run: |
+          set -e
+          xcodebuild \
+            -workspace ios/NewExpensify.xcworkspace \
+            -scheme NewExpensify \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -derivedDataPath ios/build \
+            -arch arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcbeautify
+
+      - name: Boot iOS simulator
+        run: |
+          UDID=$(xcrun simctl list devices --json \
+            | jq -r '[.devices[][] | select(.name | test("iPhone 1[567]"; "i"))] | .[0].udid')
+          if [ -z "$UDID" ] || [ "$UDID" = "null" ]; then
+            UDID=$(xcrun simctl create smoke-iphone com.apple.CoreSimulator.SimDeviceType.iPhone-15 \
+              "$(xcrun simctl list runtimes --json | jq -r '[.runtimes[] | select(.platform == "iOS" and .isAvailable == true)] | .[-1].identifier')")
+          fi
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          echo "Booted $UDID"
+
+      - name: Run smoke (LLM-driven)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: npm run smoke:ios:llm -- tests/smoke/ios-signin.testcase.txt
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: smoke-ios-llm-fork-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
