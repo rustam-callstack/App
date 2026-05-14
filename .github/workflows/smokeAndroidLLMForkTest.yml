@@ -56,6 +56,31 @@ jobs:
             sudo udevadm trigger --name-match=kvm
           fi
 
+      - name: Free disk space (ubuntu-latest only)
+        # Free ~25 GB by removing pre-installed tooling we don't use.
+        # Run 25851889632 failed during react-native-reanimated CMake
+        # compile with "No space left on device" — the runner ships
+        # with ~14 GB free, and Gradle + Pods + DerivedData + the
+        # AVD cache combined exceed that under load. Earlier fork-test
+        # runs got lucky; this step makes the headroom predictable.
+        # NOT applied to the upstream Blacksmith runner (it has more
+        # disk and the wrong preinstalled set anyway).
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/heroku
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/PyPy
+          sudo rm -rf /opt/hostedtoolcache/Ruby
+          sudo rm -rf /opt/hostedtoolcache/go
+          sudo apt-get -qy autoremove --purge
+          sudo apt-get -qy clean
+          docker rmi $(docker image ls -aq) 2>/dev/null || true
+          df -h / | tail -1
+
       - name: Setup Java
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12
         with:
