@@ -28,7 +28,15 @@ jobs:
   smoke:
     name: iOS simulator smoke LLM (fork-test)
     if: ${{ github.repository == 'rustam-callstack/App' }}
-    runs-on: macos-latest
+    # Switched from `macos-latest` (free GHA) to Blacksmith Mac after
+    # 7 consecutive iOS runs (25861525119, 25864724817, 25868449643,
+    # 25917335736, 25924098549, 26024660329, 26026784114) showed the
+    # agent-device daemon's internal xcodebuild test runner timing out
+    # intermittently on the free GHA tier. Blacksmith's M-series
+    # hardware should satisfy the daemon's internal budget more
+    # reliably. Requires Blacksmith access on the fork — verify at
+    # dispatch time.
+    runs-on: blacksmith-12vcpu-macos-latest
     timeout-minutes: 90
     env:
       AGENT_DEVICE_VERSION: "0.14.7"
