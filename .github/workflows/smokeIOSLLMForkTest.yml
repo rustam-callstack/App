@@ -36,7 +36,13 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 90
     env:
-      AGENT_DEVICE_VERSION: "0.14.7"
+      # 0.14.8 (2026-05-11) and 0.14.9 (2026-05-13) shipped after our
+      # initial 0.14.7 pin. 0.14.7's daemon hangs on `agent-device
+      # snapshot` calls on free macos-latest (6/6 retries on run pool
+      # produced `Error (COMMAND_FAILED): Daemon request timed out`).
+      # Bumping to 0.14.9 to test whether the daemon bug was fixed
+      # upstream. If this lands green, port the bump to Android too.
+      AGENT_DEVICE_VERSION: "0.14.9"
       STANDALONE_NEW_DOT: "true"
       LLM_TOKEN_BUDGET: "200000"
       ANTHROPIC_MODEL: "claude-sonnet-4-6"
