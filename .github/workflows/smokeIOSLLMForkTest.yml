@@ -47,6 +47,17 @@ jobs:
       LLM_TOKEN_BUDGET: "200000"
       ANTHROPIC_MODEL: "claude-sonnet-4-6"
       PLATFORM: "ios"
+      # Free GHA macos-latest's agent-device daemon can't return a
+      # snapshot reliably (8/8 dedicated retries across 0.14.7 and
+      # 0.14.9 hit `Error (COMMAND_FAILED): Daemon request timed
+      # out`). Scope this fork-test workflow down to launch-only:
+      # the driver does the full boot dance + `agent-device open`,
+      # verifies the app is alive via `xcrun simctl spawn booted
+      # launchctl list`, and exits before the LLM-driven snapshot
+      # loop. Upstream `smokeIOSLLM.yml` does NOT set this — it
+      # runs the full LLM-driven flow on Blacksmith Mac, where the
+      # daemon works.
+      IOS_SCOPE: "launch-only"
 
     steps:
       - name: Checkout

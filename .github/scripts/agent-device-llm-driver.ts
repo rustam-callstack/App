@@ -102,6 +102,22 @@ const TEXT_LENGTH_CAP = 200;
  * artifacts and CI stdout slim.
  */
 const DEBUG_LLM = process.env.DEBUG_LLM === "1";
+/*
+ * IOS_SCOPE=launch-only is an escape hatch for free GHA macos-latest,
+ * where agent-device's daemon `snapshot` command times out
+ * consistently (8/8 dedicated attempts across versions 0.14.7 and
+ * 0.14.9 — the daemon's snapshot path is unreliable on that runner
+ * class). In launch-only mode the runner:
+ *   - does the full boot dance (install, Metro, agent-device open)
+ *   - verifies the app process via `xcrun simctl spawn booted
+ *     launchctl list` (does NOT call agent-device snapshot)
+ *   - declares success and exits without running the LLM-driven
+ *     test-case steps
+ * Upstream PRs are still wired for the full LLM-driven flow on
+ * Blacksmith Mac (where the daemon is reliable). This env is set
+ * only on the fork-test workflow.
+ */
+const IOS_LAUNCH_ONLY = process.env.IOS_SCOPE === "launch-only";
 
 /* ---- types ------------------------------------------------------------ */
 
@@ -154,6 +170,17 @@ async function main(): Promise<void> {
   };
 
   await bootApp();
+
+  if (IOS_LAUNCH_ONLY) {
+    fs.writeFileSync(
+      path.join(ARTIFACTS_DIR, "ios-launch-only-ok.txt"),
+      `mode: launch-only\n` +
+        `bundle: ${platform.appPackage}\n` +
+        `timestamp: ${new Date().toISOString()}\n`,
+    );
+    log("::notice::iOS launch-only smoke OK");
+    return;
+  }
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   const llm = apiKey
@@ -250,6 +277,45 @@ function parseTestCase(raw: string): Step[] {
 
 /* ---- boot dance (matches Phase 0's bash) ------------------------------ */
 
+/**
+ * Direct (non-agent-device) iOS app liveness check via `xcrun simctl
+ * spawn booted launchctl list`. Output lines look like:
+ *
+ *   1234   0    UIKitApplication-com.expensify.chat.dev-...
+ *   -      0    UIKitApplication-com.other.app-...
+ *
+ * A numeric leading column means the process is running; `-` means
+ * registered-but-not-running. We accept any line whose label
+ * contains the bundle id AND has a numeric PID.
+ *
+ * Used by launch-only mode (`IOS_SCOPE=launch-only`) to validate
+ * `platform.launch()` actually started the app, without going
+ * through agent-device's daemon (whose `snapshot` is unreliable
+ * on free macos-latest).
+ */
+function verifyIOSAppRunningViaSimctl(bundleId: string): boolean {
+  try {
+    const output = execFileSync(
+      "xcrun",
+      ["simctl", "spawn", "booted", "launchctl", "list"],
+      { encoding: "utf8", timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+    );
+    const matches = output
+      .split("\n")
+      .filter((l) => l.includes(bundleId))
+      .filter((l) => /^\s*\d+\s+/.test(l));
+    if (matches.length) {
+      log(`launchctl: found ${matches.length} running entry/entries`);
+      return true;
+    }
+    log(`launchctl: no running entries for ${bundleId}`);
+    return false;
+  } catch (e) {
+    log(`launchctl: query failed: ${(e as Error).message.slice(0, 120)}`);
+    return false;
+  }
+}
+
 async function bootApp(): Promise<void> {
   log(`boot: platform=${platform.name}`);
   log("boot: closing stale session");
@@ -277,6 +343,26 @@ async function bootApp(): Promise<void> {
 
   log("boot: agent-device open --relaunch");
   platform.launch();
+
+  if (platform.name === "ios" && IOS_LAUNCH_ONLY) {
+    /*
+     * Launch-only path: agent-device's daemon `snapshot` doesn't work
+     * on free macos-latest, but `open` does and so does direct
+     * `xcrun simctl`. Use simctl (no agent-device daemon) to confirm
+     * the app's UIKit launcher process is alive, then exit the boot
+     * dance early. The main() flow checks IOS_LAUNCH_ONLY and skips
+     * the LLM-driven test-case loop.
+     */
+    log("boot[ios-launch-only]: verifying app via xcrun simctl");
+    const launchctlOk = verifyIOSAppRunningViaSimctl(platform.appPackage);
+    if (!launchctlOk) {
+      fail(
+        `iOS launch-only: ${platform.appPackage} not in launchctl list after open`,
+      );
+    }
+    log("boot[ios-launch-only]: OK (process present in launchctl list)");
+    return;
+  }
 
   /*
    * Bounded wait for the SignIn UI to hydrate. The LLM can technically
